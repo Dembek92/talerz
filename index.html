@@ -202,19 +202,19 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 const ex = (name, sets, reps, rest) => ({name, sets, reps, rest});
 
 const DEFAULT_PLANS = [
-  {id:uid(), name:'Push', color:'red', exercises:[
+  {id:uid(), def:true, name:'Push', color:'red', exercises:[
     ex('Wyciskanie sztangi na ławce płaskiej',4,8,120), ex('Wyciskanie hantli na skosie',3,10,90),
     ex('Wyciskanie żołnierskie',3,8,120), ex('Rozpiętki z hantlami',3,12,60),
     ex('Pompki na poręczach',3,10,90), ex('Prostowanie ramion na wyciągu',3,12,60)]},
-  {id:uid(), name:'Pull', color:'blue', exercises:[
+  {id:uid(), def:true, name:'Pull', color:'blue', exercises:[
     ex('Martwy ciąg',4,5,180), ex('Podciąganie na drążku',4,8,120),
     ex('Wiosłowanie sztangą',3,10,90), ex('Ściąganie drążka wyciągu',3,12,75),
     ex('Face pull',3,15,60), ex('Uginanie ramion ze sztangą',3,10,60)]},
-  {id:uid(), name:'Nogi', color:'green', exercises:[
+  {id:uid(), def:true, name:'Nogi', color:'green', exercises:[
     ex('Przysiad ze sztangą',4,6,180), ex('Rumuński martwy ciąg',3,8,120),
     ex('Wykroki z hantlami',3,10,90), ex('Prostowanie nóg na maszynie',3,12,60),
     ex('Uginanie nóg na maszynie',3,12,60), ex('Wspięcia na palce',4,15,45)]},
-  {id:uid(), name:'Całe ciało (FBW)', color:'yellow', exercises:[
+  {id:uid(), def:true, name:'Całe ciało (FBW)', color:'yellow', exercises:[
     ex('Przysiad ze sztangą',3,8,120), ex('Wyciskanie sztangi na ławce płaskiej',3,8,120),
     ex('Wiosłowanie hantlą',3,10,90), ex('Wyciskanie hantli nad głowę',3,10,90),
     ex('Brzuszki na wyciągu',3,15,60)]},
@@ -233,7 +233,7 @@ const KEY='talerz-data';
 let warned=false;
 function applyData(raw){
   const d = JSON.parse(raw);
-  S = {plans: d.plans || DEFAULT_PLANS, history: d.history || [], active: d.active || null, profile: d.profile || null, settings: {...DEFAULT_SETTINGS, ...(d.settings||{})}, program: d.program || null, adjApplied: d.adjApplied || []};
+  S = {plans: d.plans || DEFAULT_PLANS, history: d.history || [], active: d.active || null, profile: d.profile || null, settings: {...DEFAULT_SETTINGS, ...(d.settings||{})}, program: d.program || null, adjApplied: d.adjApplied || [], meta: d.meta || {}, deleted: d.deleted || {h:{}, pk:{}}};
 }
 async function load(){
   try{
@@ -247,7 +247,8 @@ async function load(){
     if(v){ applyData(v); return; }
   }catch(e){ /* pamięć przeglądarki niedostępna */ }
 }
-async function save(){
+async function save(){ await saveLocal(); scheduleSync(); }
+async function saveLocal(){
   const json = JSON.stringify(S);
   try{
     if(window.storage){
@@ -261,6 +262,134 @@ async function save(){
     toast('Zapis automatyczny niedostępny. Użyj „Kopia zapasowa” w zakładce Plany.');
   }
 }
+/* ---------- synchronizacja przez prywatne repozytorium GitHub ---------- */
+const SYNC_KEY = 'talerz-sync', SYNC_FILE = 'talerz-dane.json';
+let syncCfg = null, syncTimer = null, syncBusy = false, syncAgain = false, lastSynced = null;
+let syncState = {s:'off', msg:'', at:null};
+function loadSyncCfg(){ try{ syncCfg = JSON.parse(localStorage.getItem(SYNC_KEY) || 'null'); }catch(e){ syncCfg = null; } }
+function storeSyncCfg(){ try{ syncCfg ? localStorage.setItem(SYNC_KEY, JSON.stringify(syncCfg)) : localStorage.removeItem(SYNC_KEY); }catch(e){} }
+const stable = v => Array.isArray(v) ? '['+v.map(stable).join(',')+']'
+  : (v && typeof v==='object') ? '{'+Object.keys(v).filter(k=>v[k]!==undefined).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}'
+  : JSON.stringify(v ?? null);
+const b64enc = str => { const b = new TextEncoder().encode(str); let bin=''; for(let i=0;i<b.length;i+=0x8000) bin += String.fromCharCode.apply(null, b.subarray(i,i+0x8000)); return btoa(bin); };
+const b64dec = s64 => new TextDecoder().decode(Uint8Array.from(atob(s64.replace(/\s/g,'')), c=>c.charCodeAt(0)));
+function syncedPart(){
+  return {v:1, plans:S.plans, history:S.history, program:S.program||null, profile:S.profile||null,
+    adjApplied:S.adjApplied||[], meta:S.meta||{}, deleted:S.deleted||{h:{}, pk:{}}};
+}
+const planKey = p => p.programKey ? 'prog:'+p.programKey : 'name:'+p.name;
+function mergeData(L, R){
+  const meta = {...(R.meta||{})};
+  for(const [k,v] of Object.entries(L.meta||{})) meta[k] = Math.max(meta[k]||0, v||0);
+  const del = {h:{...(R.deleted?.h||{})}, pk:{...(R.deleted?.pk||{})}};
+  for(const [k,v] of Object.entries(L.deleted?.h||{})) del.h[k] = Math.max(del.h[k]||0, v);
+  for(const [k,v] of Object.entries(L.deleted?.pk||{})) del.pk[k] = Math.max(del.pk[k]||0, v);
+  // historia: suma po id
+  const hm = new Map();
+  [...(R.history||[]), ...(L.history||[])].forEach(h => {
+    const prev = hm.get(h.id);
+    hm.set(h.id, prev ? {...prev, ...h, week: h.week ?? prev.week, programKey: h.programKey ?? prev.programKey} : h);
+  });
+  const history = [...hm.values()].filter(h=>!del.h[h.id]).sort((a,b)=>a.startedAt-b.startedAt);
+  // plany: po id albo po nazwie / dniu programu; wygrywa nowsza zmiana
+  const lAdj = (L.adjApplied||[]).includes(ADJ_ID), rAdj = (R.adjApplied||[]).includes(ADJ_ID);
+  const pick = (l, r) => {
+    const lt = l.updatedAt||0, rt = r.updatedAt||0;
+    if(lt !== rt) return lt > rt ? l : r;
+    if(l.programKey && lAdj !== rAdj) return lAdj ? l : r;
+    if(!!l.def !== !!r.def) return l.def ? r : l;
+    return l.id <= r.id ? l : r;
+  };
+  const rPlans = R.plans||[], used = new Set(), plans = [];
+  (L.plans||[]).forEach(l => {
+    const r = rPlans.find(x=>!used.has(x) && x.id===l.id) || rPlans.find(x=>!used.has(x) && planKey(x)===planKey(l));
+    if(r){ used.add(r); plans.push(pick(l, r)); } else plans.push(l);
+  });
+  rPlans.forEach((r, i) => {
+    if(used.has(r)) return;
+    let at = plans.length;
+    for(let j=i-1; j>=0; j--){ const k = plans.findIndex(x=>planKey(x)===planKey(rPlans[j])); if(k>=0){ at = k+1; break; } }
+    plans.splice(at, 0, r);
+  });
+  const keptPlans = plans.filter(p => !(del.pk[planKey(p)] > (p.updatedAt||0)));
+  const choose = k => { const lt = L.meta?.[k]||0, rt = R.meta?.[k]||0; return lt > rt ? L[k] : (R[k] ?? L[k] ?? null); };
+  return {v:1, plans:keptPlans, history, program:choose('program'), profile:choose('profile'),
+    adjApplied:[...new Set([...(L.adjApplied||[]), ...(R.adjApplied||[])])].sort(), meta, deleted:del};
+}
+async function ghFetch(path, opts={}){
+  return fetch('https://api.github.com/repos/'+syncCfg.repo+path, {cache:'no-store', ...opts, headers:{
+    Authorization: 'Bearer '+syncCfg.token, 'X-GitHub-Api-Version':'2022-11-28',
+    Accept: opts.raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
+    ...(opts.body ? {'Content-Type':'application/json'} : {})}});
+}
+function syncError(status){
+  if(status===401) return 'Klucz dostępu jest nieprawidłowy albo wygasł. Utwórz nowy i połącz ponownie.';
+  if(status===403) return 'Klucz nie ma uprawnienia do zapisu (Contents: Read and write).';
+  if(status===404) return 'Nie znaleziono repozytorium albo klucz nie ma do niego dostępu.';
+  return 'Błąd GitHub ('+status+'). Spróbuję ponownie później.';
+}
+async function remoteGet(){
+  const r = await ghFetch('/contents/'+SYNC_FILE);
+  if(r.status===404) return {data:null, sha:null};
+  if(!r.ok) throw {status:r.status};
+  const j = await r.json();
+  let text = (j.content && j.encoding==='base64') ? b64dec(j.content) : null;
+  if(!text){ const r2 = await ghFetch('/contents/'+SYNC_FILE, {raw:true}); if(!r2.ok) throw {status:r2.status}; text = await r2.text(); }
+  return {data: JSON.parse(text), sha: j.sha};
+}
+function setSync(s, msg){
+  syncState = {s, msg: msg||'', at: s==='ok' ? Date.now() : syncState.at};
+  const el = document.getElementById('syncStatus'); if(el) el.innerHTML = syncStatusHtml();
+}
+function syncStatusHtml(){
+  if(syncState.s==='busy') return 'Synchronizuję…';
+  if(syncState.s==='err') return `<span style="color:var(--red)">${esc(syncState.msg)}</span>`;
+  if(syncState.at) return 'Zsynchronizowano o '+new Date(syncState.at).toLocaleTimeString('pl-PL',{hour:'2-digit',minute:'2-digit'});
+  return 'Połączono';
+}
+function scheduleSync(ms){
+  if(!syncCfg) return;
+  if(lastSynced !== null && stable(syncedPart()) === lastSynced) return;
+  clearTimeout(syncTimer); syncTimer = setTimeout(()=>syncNow(), ms ?? 2500);
+}
+async function syncNow(){
+  if(!syncCfg) return;
+  if(!navigator.onLine){ setSync('err','Brak internetu — zsynchronizuję, gdy wróci połączenie.'); return; }
+  if(syncBusy){ syncAgain = true; return; }
+  syncBusy = true; setSync('busy');
+  try{
+    for(let attempt=0; attempt<3; attempt++){
+      const {data, sha} = await remoteGet();
+      const local = syncedPart();
+      const merged = data ? mergeData(local, data) : local;
+      const mStr = stable(merged);
+      const localChanged = mStr !== stable(local);
+      if(mStr !== (data ? stable({...data, savedAt:undefined}) : null)){
+        const r = await ghFetch('/contents/'+SYNC_FILE, {method:'PUT', body: JSON.stringify({
+          message: 'Talerz: synchronizacja danych', content: b64enc(JSON.stringify({...merged, savedAt: Date.now()})), ...(sha?{sha}:{})})});
+        if(r.status===409 || r.status===422) continue;   // ktoś zapisał w międzyczasie – pobierz i połącz jeszcze raz
+        if(!r.ok) throw {status:r.status};
+      }
+      if(localChanged){
+        Object.assign(S, merged); delete S.v;
+        await saveLocal();
+        const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+        if(['plans','history','progress'].includes(view) && !typing) render();
+      }
+      lastSynced = mStr;
+      setSync('ok'); return;
+    }
+    throw {status:409};
+  }catch(e){
+    setSync('err', e && e.status ? syncError(e.status) : 'Brak połączenia z GitHub — spróbuję ponownie.');
+  }finally{
+    syncBusy = false;
+    if(syncAgain){ syncAgain = false; scheduleSync(800); }
+  }
+}
+window.addEventListener('online', () => syncNow());
+document.addEventListener('visibilitychange', () => { if(document.visibilityState==='visible') syncNow(); });
+
 function toast(msg){
   document.querySelector('.toast')?.remove();
   const t = document.createElement('div'); t.className='toast'; t.textContent=msg; t.setAttribute('role','status');
@@ -522,6 +651,22 @@ function vPlans(){
   <div class="opt"><span>Odliczanie 3, 2, 1</span><button class="sw" data-a="toggleSet" data-k="countdown" aria-pressed="${S.settings.countdown}" aria-label="Odliczanie 3, 2, 1"></button></div>
   <div class="opt"><span>Ekran nie gaśnie w trakcie treningu</span><button class="sw" data-a="toggleSet" data-k="awake" aria-pressed="${S.settings.awake}" aria-label="Ekran nie gaśnie w trakcie treningu"></button></div>
   <button class="btn ghost full" data-a="testAlarm" style="margin-top:12px">Wypróbuj dźwięk</button>
+  <h2 style="margin-top:28px">Synchronizacja</h2>
+  ${syncCfg ? `<p style="font-size:15px">Połączono z <b>${esc(syncCfg.repo)}</b></p>
+    <p class="note" id="syncStatus" style="margin-top:2px">${syncStatusHtml()}</p>
+    <div class="row" style="margin-top:10px">
+      <button class="btn ghost" data-a="syncNow">Synchronizuj teraz</button>
+      <button class="btn ghost" data-a="syncOff">Rozłącz</button>
+    </div>`
+  : `<p class="note" style="margin-top:0">Dane zapisują się w Twoim prywatnym repozytorium GitHub, więc te same plany i treningi widzisz na telefonie i komputerze.</p>
+    <div class="ed">
+      <label for="syncRepo">Repozytorium (login/nazwa)</label>
+      <input id="syncRepo" placeholder="login/talerz-dane" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <label for="syncToken">Klucz dostępu (token)</label>
+      <input id="syncToken" type="password" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <p class="note" id="syncStatus" style="margin-top:6px">${syncState.s==='err' ? syncStatusHtml() : ''}</p>
+    <button class="btn primary full" data-a="syncConnect" style="margin-top:8px">Połącz</button>`}
   <h2 style="margin-top:28px">Kopia zapasowa</h2>
   <div class="row">
     <button class="btn ghost" data-a="backup">Skopiuj dane</button>
@@ -947,6 +1092,7 @@ const actions = {
       if(!(hr>=40 && hr<=220)){ toast('Tętno powinno mieścić się między 40 a 220'); return; }
       kcal = calcKcal(hr, minutes, f.prof);
       if(kcal==null){ toast('Uzupełnij wiek (10–100) i wagę (30–300 kg)'); f.editProfile=true; render(); return; }
+      S.meta = {...(S.meta||{}), profile: Date.now()};
       S.profile = {sex: f.prof.sex==='k'?'k':'m', age: parseInt(f.prof.age), weight: parseFloat(String(f.prof.weight).replace(',','.'))};
     }
     const setCount = a.exercises.filter(x=>!x.warmup).reduce((n,x)=>n+x.done.length,0);
@@ -958,15 +1104,19 @@ const actions = {
   },
   delHist: d => {
     if(!confirm('Usunąć ten trening z historii?')) return;
+    S.deleted = S.deleted || {h:{}, pk:{}}; S.deleted.h[d.id] = Date.now();
     S.history = S.history.filter(h=>h.id!==d.id); save(); render();
   },
   addProgram: () => {
+    S.deleted = S.deleted || {h:{}, pk:{}};
+    S.plans.filter(p=>p.programId===PROGRAM.id).forEach(p=>{ S.deleted.pk[planKey(p)] = Date.now()-1; });
     S.plans = S.plans.filter(p=>p.programId!==PROGRAM.id);
-    PROGRAM.plans.forEach(pl => S.plans.push({
+    PROGRAM.plans.forEach(pl => S.plans.push({ updatedAt: Date.now(),
       id: uid(), name: pl.name, color: pl.color, programId: PROGRAM.id, programKey: pl.key,
       exercises: JSON.parse(JSON.stringify(pl.exercises))
     }));
     const today = todayStart(), def = parseDay(PROGRAM.start);
+    S.meta = {...(S.meta||{}), program: Date.now()};
     S.program = {id: PROGRAM.id, start: today > def + 6*DAY ? shiftDate(PROGRAM.start, Math.floor((today-def)/DAY)) : PROGRAM.start};
     ensureWarmups(); save(); render(); toast('Program dodany — 4 dni treningowe i test');
   },
@@ -974,7 +1124,7 @@ const actions = {
     const keys = PROGRAM.plans.map(pl=>pl.key);
     PROGRAM.plans.forEach((pl, k) => {
       if(S.plans.some(p => p.programId===PROGRAM.id && p.programKey===pl.key)) return;
-      const plan = {id: uid(), name: pl.name, color: pl.color, programId: PROGRAM.id, programKey: pl.key,
+      const plan = {id: uid(), updatedAt: Date.now(), name: pl.name, color: pl.color, programId: PROGRAM.id, programKey: pl.key,
         exercises: JSON.parse(JSON.stringify(pl.exercises))};
       // wstaw za poprzednim dniem programu, żeby zachować kolejność
       let at = -1;
@@ -983,7 +1133,28 @@ const actions = {
     });
     ensureWarmups(); save(); render(); toast('Przywrócono brakujące plany');
   },
-  progShift: d => { S.program.start = shiftDate(S.program.start, +d.d); save(); render(); },
+  progShift: d => { S.program.start = shiftDate(S.program.start, +d.d); S.meta = {...(S.meta||{}), program: Date.now()}; save(); render(); },
+  syncConnect: async () => {
+    const repo = (document.getElementById('syncRepo').value||'').trim().replace(/^https?:\/\/github\.com\//,'').replace(/\/$/,'');
+    const token = (document.getElementById('syncToken').value||'').trim();
+    if(!/^[\w.-]+\/[\w.-]+$/.test(repo)){ setSync('err','Wpisz repozytorium w formacie login/nazwa, np. dembek92/talerz-dane.'); return; }
+    if(!token){ setSync('err','Wklej klucz dostępu (token).'); return; }
+    syncCfg = {repo, token}; setSync('busy');
+    try{
+      const r = await ghFetch('');
+      if(!r.ok){ const st = r.status; syncCfg = null; setSync('err', syncError(st)); return; }
+      const j = await r.json();
+      if(!j.private){ syncCfg = null; setSync('err','To repozytorium jest publiczne — Twoje treningi i waga byłyby widoczne dla wszystkich. Ustaw je jako prywatne albo utwórz nowe, prywatne.'); return; }
+    }catch(e){ syncCfg = null; setSync('err','Brak połączenia z GitHub.'); return; }
+    storeSyncCfg(); lastSynced = null; render();
+    await syncNow();
+    if(syncState.s==='ok') toast('Połączono — dane są zsynchronizowane');
+  },
+  syncNow: () => { lastSynced = null; syncNow(); },
+  syncOff: () => {
+    if(!confirm('Rozłączyć synchronizację? Dane zostaną na tym urządzeniu i w repozytorium.')) return;
+    syncCfg = null; storeSyncCfg(); syncState = {s:'off', msg:'', at:null}; render();
+  },
   toggleSet: d => {
     S.settings[d.k] = !S.settings[d.k]; save(); render();
     if(d.k==='sound' && S.settings.sound){ unlockAudio(); ringAlarm(); }
@@ -1032,11 +1203,13 @@ const actions = {
     if(!p.name){ toast('Nadaj planowi nazwę'); render(); return; }
     if(!p.exercises.length){ toast('Dodaj przynajmniej jedno ćwiczenie'); p.exercises=[ex('',3,10,90)]; render(); return; }
     const isNew = p.isNew; delete p.isNew; delete p.movedTo;
+    p.updatedAt = Date.now(); delete p.def;
     if(isNew) S.plans.push(p); else S.plans = S.plans.map(x=>x.id===p.id?p:x);
     editing=null; view='plans'; save(); render(); toast('Plan zapisany');
   },
   delPlan: () => {
     if(!confirm('Usunąć ten plan? Historia treningów zostanie.')) return;
+    S.deleted = S.deleted || {h:{}, pk:{}}; S.deleted.pk[planKey(editing)] = Date.now();
     S.plans = S.plans.filter(x=>x.id!==editing.id); editing=null; view='plans'; save(); render();
   },
 };
@@ -1056,7 +1229,7 @@ document.addEventListener('input', e => {
 
 document.addEventListener('change', e => {
   const t = e.target;
-  if(t.dataset.progstart !== undefined && t.value && S.program){ S.program.start = t.value; save(); render(); }
+  if(t.dataset.progstart !== undefined && t.value && S.program){ S.program.start = t.value; S.meta = {...(S.meta||{}), program: Date.now()}; save(); render(); }
 });
 
 /* ---------- ticking clock ---------- */
@@ -1083,7 +1256,8 @@ setInterval(() => {
   }
 }, 250);
 
-load().then(()=>{ S.settings = {...DEFAULT_SETTINGS, ...(S.settings||{})}; const before = JSON.stringify(S.plans); ensureWarmups(); const hw = fillHistoryWeeks(); const adj = applyAdjustments(); if(hw || adj || JSON.stringify(S.plans)!==before) save(); if(adj) setTimeout(()=>toast('Wprowadzono korekty ciężarów z analizy tygodnia 1'), 400); if(S.active) view = S.active.fin ? 'finish' : 'workout'; render(); });
+loadSyncCfg();
+load().then(()=>{ S.settings = {...DEFAULT_SETTINGS, ...(S.settings||{})}; const before = JSON.stringify(S.plans); ensureWarmups(); const hw = fillHistoryWeeks(); const adj = applyAdjustments(); if(hw || adj || JSON.stringify(S.plans)!==before) save(); if(adj) setTimeout(()=>toast('Wprowadzono korekty ciężarów z analizy tygodnia 1'), 400); if(S.active) view = S.active.fin ? 'finish' : 'workout'; render(); syncNow(); });
 </script>
 </body>
 </html>
